@@ -8,6 +8,7 @@ import {
   injectBreakpointIfAbsent,
   normalizeTailBreakpoints,
   rewriteCacheControl,
+  stripIntermediateMessageBreakpoints,
 } from "./cache.js";
 import { rewriteSystemModelRefs } from "./model.js";
 import {
@@ -79,13 +80,14 @@ export function createServer({ config, transformFn }) {
       }
 
       if (parsed && AUTO_CACHE) {
+        const strippedMid = stripIntermediateMessageBreakpoints(parsed);
         const { tag, tailBlocks } = injectBreakpointIfAbsent(parsed, { tailTtl: TAIL_TTL });
         const clientTail = normalizeTailBreakpoints(parsed, TAIL_TTL);
         const skip = new Set([...tailBlocks, ...clientTail]);
         const counter = { rewritten: 0, alreadySet: 0, skipped: 0 };
         rewriteCacheControl(parsed, counter, skip);
         notes.push(
-          `cache=rewrote:${counter.rewritten},already:${counter.alreadySet},skipped:${counter.skipped},inject:${tag},tail-ttl:${TAIL_TTL}`,
+          `cache=rewrote:${counter.rewritten},already:${counter.alreadySet},skipped:${counter.skipped},inject:${tag},mid-stripped:${strippedMid},tail-ttl:${TAIL_TTL}`,
         );
       }
 

@@ -261,6 +261,7 @@ Legend: 🟢 safe to drop if unused · 🟡 drop with caveats (feature goes away
 | `PushNotification`                                   | Push desktop/mobile notifications via Remote Control.            | 🟢 Drop. Rarely needed.                                                             |
 | `RemoteTrigger`                                      | Call the claude.ai remote-trigger API (routines/schedules).      | 🟢 Drop unless you manage scheduled remote agents.                                  |
 | `Skill`                                              | Invoke a named skill (`/skills`).                                | 🟡 Drop only if you never use skills or slash-commands.                             |
+| `ShareOnboardingGuide`                               | Upload ONBOARDING.md and return a shareable link for teammates.  | 🟢 Drop unless you use team onboarding guides.                                      |
 | `mcp__ide__getDiagnostics`                           | Pull IDE diagnostics (only appears with IDE extension attached). | 🟢 Drop if you don't use the IDE extension.                                         |
 
 A conservative starter set: `DROP_TOOLS=NotebookEdit,CronCreate,CronDelete,CronList,RemoteTrigger,PushNotification,Monitor,EnterWorktree,ExitWorktree`.

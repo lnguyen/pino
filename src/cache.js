@@ -58,6 +58,22 @@ export function normalizeTailBreakpoints(body, tailTtl) {
   return out;
 }
 
+export function stripIntermediateMessageBreakpoints(body) {
+  if (!Array.isArray(body?.messages) || body.messages.length <= 2) return 0;
+  let stripped = 0;
+  for (let i = 1; i < body.messages.length - 1; i++) {
+    const content = body.messages[i].content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (block && typeof block === "object" && block.cache_control) {
+        delete block.cache_control;
+        stripped += 1;
+      }
+    }
+  }
+  return stripped;
+}
+
 function hasBreakpoint(arr) {
   return Array.isArray(arr) && arr.some(
     (x) => x && typeof x === "object" && x.cache_control && x.cache_control.type === "ephemeral",
