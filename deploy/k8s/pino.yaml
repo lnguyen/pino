@@ -1,0 +1,105 @@
+# Pino proxy + savings dashboard for Kubernetes.
+#
+#   kubectl apply -f deploy/k8s/pino.yaml
+#   kubectl -n pino port-forward svc/pino 8898:8898   # then http://localhost:8898/__pino/
+#
+# Single replica on purpose: the metrics DB is a PVC-backed SQLite file
+# (ReadWriteOnce). A proxy is I/O-bound — one pod handles plenty; scale
+# vertically. For multi-replica HA, swap src/store.rs to Postgres.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pino
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pino-config
+  namespace: pino
+data:
+  PORT: "8898"
+  BIND_HOST: "0.0.0.0"
+  AUTO_CACHE: "1"
+  TAIL_TTL: "1h"
+  METRICS: "1"
+  DASHBOARD: "1"
+  DB_PATH: "/data/metrics.db"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pino-secret
+  namespace: pino
+type: Opaque
+stringData:
+  # Gate the /__pino/* dashboard + API. Clients still send their own x-api-key
+  # to upstream; the proxy never stores it.
+  DASHBOARD_TOKEN: "change-me-please"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pino-data
+  namespace: pino
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pino
+  namespace: pino
+  labels: { app: pino }
+spec:
+  replicas: 1
+  strategy: { type: Recreate } # RWO volume can't be shared across rollout
+  selector:
+    matchLabels: { app: pino }
+  template:
+    metadata:
+      labels: { app: pino }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: pino
+          image: pino-proxy:latest # build & push your own
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http, containerPort: 8898 }
+          envFrom:
+            - configMapRef: { name: pino-config }
+            - secretRef: { name: pino-secret }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 3
+            periodSeconds: 15
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "50m", memory: "96Mi" }
+            limits: { cpu: "500m", memory: "256Mi" }
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: pino-data }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pino
+  namespace: pino
+spec:
+  type: ClusterIP # not exposed publicly; port-forward or add your own Ingress
+  selector: { app: pino }
+  ports:
+    - { name: http, port: 8898, targetPort: http }

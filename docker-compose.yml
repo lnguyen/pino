@@ -1,0 +1,30 @@
+# Pino proxy + savings dashboard — laptop edition.
+#
+#   docker compose up -d --build      # start (and rebuild on code changes)
+#   docker compose logs -f            # watch
+#   docker compose down               # stop
+#
+# Dashboard:  http://localhost:8898/__pino/
+# Point a client at the proxy:  export ANTHROPIC_BASE_URL=http://localhost:8898
+#
+# Metrics persist on your local disk at ./data (bind mount), so your savings
+# history survives restarts. Host port 8898 avoids your existing proxy on 8787.
+
+services:
+  pino:
+    build: .
+    image: pino-proxy:latest
+    container_name: pino
+    restart: unless-stopped
+    ports:
+      - "8898:8898"
+    volumes:
+      - ./data:/data            # savings DB on local disk
+    environment:
+      PORT: "8898"
+      AUTO_CACHE: "1"
+      TAIL_TTL: "1h"            # force the rolling tail onto the 1h tier too
+      METRICS: "1"
+      DASHBOARD: "1"
+      DB_PATH: /data/metrics.db
+      # DASHBOARD_TOKEN: "set-me-to-gate-the-dashboard"

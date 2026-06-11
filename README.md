@@ -4,8 +4,7 @@
 # Pino proxy
 
 [![License](https://img.shields.io/github/license/alxsuv/pino)](./LICENSE)
-[![Node](https://img.shields.io/badge/node-%E2%89%A5%2020-43853d?logo=node.js&logoColor=white)](https://nodejs.org)
-[![Zero dependencies](https://img.shields.io/badge/dependencies-0-brightgreen)](./package.json)
+[![Rust](https://img.shields.io/badge/rust-%E2%89%A5%201.80-ce422b?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![GitHub stars](https://img.shields.io/github/stars/alxsuv/pino?style=social)](https://github.com/alxsuv/pino/stargazers)
 
 [![Saves ~90% on Claude Code API](https://img.shields.io/badge/Claude%20Code%20API-~90%25%20saved-blueviolet?style=for-the-badge&logo=anthropic&logoColor=white)](#savings-math)
@@ -13,7 +12,7 @@
 </div>
 
 
-> **Aggressively trim your Claude Code API bill.** Zero runtime dependencies, no build step, no SaaS. A ~500-line local reverse proxy that auto-places prompt-cache breakpoints the way Claude Code *should* be placing them.
+> **Aggressively trim your Claude Code API bill.** A small, fast async Rust reverse proxy (tokio + hyper/axum) that auto-places prompt-cache breakpoints the way Claude Code *should* be placing them. No SaaS. Metering decode + SQLite writes run on a dedicated worker thread, off the request path — the proxy keeps accepting connections under heavy concurrent load.
 
 A tiny local HTTP reverse proxy in front of `api.anthropic.com`. It forwards everything to upstream untouched **except** `/v1/messages` requests, where it optionally:
 
@@ -21,7 +20,8 @@ A tiny local HTTP reverse proxy in front of `api.anthropic.com`. It forwards eve
 - **Upgrades TTL to 1h** on cacheable content that doesn't change often. Claude Code does set `cache_control: {type: "ephemeral"}` on the system prompt, but **omits the `ttl` field** — which silently falls back to the new 5-minute default, so a thoughtful turn that takes a few minutes to read can blow past the window and re-pay the 1.25× write on the next turn. The proxy rewrites every ephemeral breakpoint to `ttl: "1h"` (except the rolling tail, which stays at 5m on purpose so you don't overpay the 2.0× write multiplier on a breakpoint that moves every turn).
 - **Drops unused tools** and scrubs their names from system reminders, shrinking request size.
 - **Strips ANSI escape codes** so terminal output in tool results caches cleanly.
-- **Makes the system prompt editable** — any part of the request body can be rewritten via a user-supplied `transform(body)` hook. No built-in system-prompt edits ship out of the box; the hook is the extension point.
+- **Restructures request bodies** — a native, env-driven transform drops unused tools, strips ANSI, and trims stale scaffolding / hoists static context to `messages[0]`. Enabled with `TRANSFORM=1`; extend it in `src/transform.rs`.
+- **Meters every request and shows the savings live** — an optional built-in dashboard (`DASHBOARD=1`) parses the response `usage`, persists it to an embedded SQLite store, and renders savings live — sliceable by **project / session / agent / model**, with a **cache-tier panel** that shows whether your 1h forcing is actually landing on the 1h tier. See [Monitoring & dashboard](#monitoring--dashboard).
 
 Designed primarily for **Claude Code**, where the same ~24k-token tool catalog ships uncached on every turn, and the ~8k-token system prompt is on a fragile 5-minute timer — Claude Code's `cache_control` omits `ttl` and silently falls back to the 5-minute default, which a single thoughtful turn (long generation, slow tool call, user reading output) is enough to blow past.
 
@@ -39,7 +39,7 @@ cache_creation:                    cache_creation:
 output_tokens:               195   output_tokens:               802
 ```
 
-Opus pricing for this pair: **~$0.34 with the proxy vs ~$2.60 without** (input + output, computed from the `usage` numbers above) — a 5m rolling tail plus 1h caching on tools / system / reminders does the heavy lifting. See [Savings math](#savings-math) for the full breakdown.
+Opus pricing for this pair: **~$0.11 with the proxy vs ~$0.87 without** (input + output, computed from the `usage` numbers above, at current Opus 4.x rates of $5/$25 per M) — a 5m rolling tail plus 1h caching on tools / system / reminders does the heavy lifting. See [Savings math](#savings-math) for the full breakdown.
 
 ## Quickstart
 
@@ -50,56 +50,71 @@ git clone https://github.com/alxsuv/pino
 cd pino
 ```
 
-No `npm install` needed — zero runtime dependencies. Requires Node >= 20.
+Build with Cargo (Rust >= 1.80). Dependencies are fetched and compiled on first build; the metrics store uses bundled SQLite (`rusqlite`), so no system SQLite is required.
 
-### 2. Start the proxy
+```bash
+cargo build --release        # produces target/release/{pino-proxy,backfill,cache-stats}
+```
+
+### Fastest path: Docker Compose (proxy + dashboard)
+
+```bash
+docker compose up -d --build
+#   proxy + dashboard → http://localhost:8898/__pino/
+#   point your client at it:
+export ANTHROPIC_BASE_URL=http://localhost:8898
+```
+
+Metrics persist to `./data` on local disk. To seed the dashboard from existing `logs/`, run `cargo run --release --bin backfill`. For Kubernetes, see [`deploy/k8s/pino.yaml`](./deploy/k8s/pino.yaml).
+
+### 2. Or start the proxy directly
 
 **Linux / macOS (bash/zsh):**
 
 ```bash
-# pure pass-through on :8787
-npm start
+# pure pass-through on :8898
+cargo run --release
 
 # typical dev setup: auto-cache + transforms + logs
 AUTO_CACHE=1 \
-TRANSFORM_FILE=./src/transforms/default.js \
+TRANSFORM=1 \
 DROP_TOOLS=NotebookEdit,CronCreate,CronDelete,CronList,RemoteTrigger,PushNotification,Monitor \
 LOG_BODIES=1 \
-npm start
+cargo run --release
 
-# or invoke the bin directly
-node bin/pino-proxy.js
+# or run the built binary directly
+./target/release/pino-proxy
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-# pure pass-through on :8787
-npm start
+# pure pass-through on :8898
+cargo run --release
 
 # typical dev setup: auto-cache + transforms + logs
 $env:AUTO_CACHE=1
-$env:TRANSFORM_FILE="./src/transforms/default.js"
+$env:TRANSFORM=1
 $env:DROP_TOOLS="NotebookEdit,CronCreate,CronDelete,CronList"
 $env:LOG_BODIES=1
-npm start
+cargo run --release
 
-# or invoke the bin directly
-node bin/pino-proxy.js
+# or run the built binary directly
+.\target\release\pino-proxy.exe
 ```
 
 **Windows (cmd.exe):**
 
 ```cmd
-:: pure pass-through on :8787
-npm start
+:: pure pass-through on :8898
+cargo run --release
 
 :: typical dev setup: auto-cache + transforms + logs
 set AUTO_CACHE=1
-set TRANSFORM_FILE=./src/transforms/default.js
+set TRANSFORM=1
 set DROP_TOOLS=NotebookEdit,CronCreate,CronDelete,CronList
 set LOG_BODIES=1
-npm start
+cargo run --release
 ```
 
 ### 3. Point your client at it
@@ -107,19 +122,19 @@ npm start
 **Linux / macOS:**
 
 ```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8898
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-$env:ANTHROPIC_BASE_URL="http://127.0.0.1:8787"
+$env:ANTHROPIC_BASE_URL="http://127.0.0.1:8898"
 ```
 
 **Windows (cmd.exe):**
 
 ```cmd
-set ANTHROPIC_BASE_URL=http://127.0.0.1:8787
+set ANTHROPIC_BASE_URL=http://127.0.0.1:8898
 ```
 
 ## How to Verify (The Smoking Gun)
@@ -128,7 +143,7 @@ You don't have to take my word for it. You can see what Claude Code actually shi
 
 1. **Start the proxy in pass-through mode** (captures logs but doesn't mutate anything yet):
    ```bash
-   LOG_BODIES=1 npm start
+   LOG_BODIES=1 cargo run --release
    ```
 
 2. **Run any command in Claude Code** (e.g., `claude "hi"`).
@@ -147,7 +162,7 @@ You don't have to take my word for it. You can see what Claude Code actually shi
 4. **Now, enable the fix**:
    Restart the proxy with `AUTO_CACHE=1`:
    ```bash
-   AUTO_CACHE=1 LOG_BODIES=1 npm start
+   AUTO_CACHE=1 LOG_BODIES=1 cargo run --release
    ```
 
    Re-run the same `jq` queries against the new `logs/*.req.json` and you'll see breakpoints added to `tools`, every ephemeral rewritten to `ttl: "1h"` (except the rolling tail), and `anthropic-beta` carrying `extended-cache-ttl-2025-04-11`.
@@ -214,11 +229,11 @@ Each of those round trips re-ships the ~24k-token tool catalog at full input pri
 | Volume                              | Pricing tier        | Without proxy | With proxy | Saved        |
 |-------------------------------------|---------------------|---------------|------------|--------------|
 | 10 trips (small task)               | Sonnet ($3/M input) | ~$1.58        | ~$0.27     | **~$1.31**   |
-|                                     | Opus ($15/M input)  | ~$7.90        | ~$1.36     | **~$6.54**   |
+|                                     | Opus ($5/M input)   | ~$2.63        | ~$0.45     | **~$2.18**   |
 | 30 trips (typical user message)     | Sonnet              | ~$4.74        | ~$0.59     | **~$4.15**   |
-|                                     | Opus                | ~$23.70       | ~$2.94     | **~$20.76**  |
+|                                     | Opus                | ~$7.90        | ~$0.98     | **~$6.92**   |
 | 100 trips (heavy session)           | Sonnet              | ~$15.80       | ~$1.69     | **~$14.11**  |
-|                                     | Opus                | ~$79.00       | ~$8.46     | **~$70.54**  |
+|                                     | Opus                | ~$26.33       | ~$2.82     | **~$23.51**  |
 
 Numbers are input-only; output costs are unchanged (output isn't cached). The cache-write surcharge (~$0.11 Sonnet / ~$0.57 Opus) is paid once per cache window, not once per round trip — so on a session that stays inside the 1h TTL, you pay it once at the start and every subsequent round trip is a pure cache read at 0.1×.
 
@@ -272,11 +287,16 @@ Check `logs/*.req.json` after a turn to see which tools your client actually shi
 
 | Var              | Default  | What it does                                                                                                                                                                                   |
 |------------------|----------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `PORT`           | `8787`   | Local port to bind (always `127.0.0.1`).                                                                                                                                                       |
+| `PORT`           | `8898`   | Local port to bind.                                                                                                                                                                            |
+| `BIND_HOST`      | `127.0.0.1` | Interface to bind. Set `0.0.0.0` for containers/k8s (the Docker image does this).                                                                                                            |
 | `AUTO_CACHE`     | off      | Enable cache breakpoint injection + 1h TTL rewrite + beta header.                                                                                                                              |
-| `TAIL_TTL`       | `5m`     | TTL for the rolling-tail breakpoint. `5m` (recommended) or `1h`. Other slots are always 1h.                                                                                                    |
-| `TRANSFORM_FILE` | —        | Path to a JS module exporting `transform(body)` for custom body edits.                                                                                                                         |
-| `DROP_TOOLS`     | —        | Comma-separated tool names to remove from `body.tools` *(requires `TRANSFORM_FILE=./src/transforms/default.js`)*.                                                                              |
+| `TAIL_TTL`       | `5m`     | TTL for the rolling-tail breakpoint. `5m` (cost-optimal on the API) or `1h` (best for stretching a Pro/Max quota across pauses). Other slots are always 1h.                                     |
+| `METRICS`        | off      | Meter each response's `usage` into the SQLite store (`DASHBOARD=1` implies this).                                                                                                              |
+| `DASHBOARD`      | off      | Serve the live dashboard + JSON API at `/__pino/` and health probes at `/healthz` · `/readyz`.                                                                                                 |
+| `DASHBOARD_TOKEN`| —        | If set, gate `/__pino/*` behind `?token=` / `Authorization: Bearer`. Recommended when `BIND_HOST=0.0.0.0`.                                                                                      |
+| `DB_PATH`        | `./data/metrics.db` | Where the metrics SQLite DB lives.                                                                                                                                                  |
+| `TRANSFORM`      | off      | Enable the native body transform (tool drops, ANSI strip, history restructuring). `TRANSFORM_FILE=<anything>` also works for back-compat.                                                       |
+| `DROP_TOOLS`     | —        | Comma-separated tool names to remove from `body.tools` *(requires `TRANSFORM=1`)*.                                                                                                            |
 | `STRIP_ANSI`     | `1`      | Strip ANSI escapes from message text + tool results. Set to `0` to disable.                                                                                                                    |
 | `TRIM_BASH_GIT`  | `0`      | Truncate the Bash tool description at its "Committing changes" section.                                                                                                                        |
 | `MODEL_OVERRIDE` | —        | Force a different model on every `/v1/messages` request (e.g. `claude-opus-4-6`). Also rewrites model-name references inside `system` blocks so the model's self-description stays consistent. |
@@ -286,17 +306,22 @@ Check `logs/*.req.json` after a turn to see which tools your client actually shi
 ## Architecture in 30 seconds
 
 ```
-bin/pino-proxy.js          # CLI entry (shebang)
-src/server.js              # HTTP server + request handler, exports startServer()
-src/config.js              # env parsing, constants, transform loader
-src/cache.js               # breakpoint inject/rewrite, beta header
-src/model.js               # model-name rewrites for system-prompt self-description
-src/logger.js              # timestamps, sanitizers, request/response log writers
-src/transforms/default.js  # default body mutator (env-driven tools/ANSI stripping)
+src/main.rs           # pino-proxy entry (tokio main, --healthcheck mode)
+src/server.rs         # axum handler + streaming tee + off-reactor metering worker
+src/config.rs         # env parsing, constants
+src/cache.rs          # breakpoint inject/rewrite (reference-free TTL skip set)
+src/model.rs          # model-name rewrites for system-prompt self-description
+src/transform.rs      # native body transform (tool drops, ANSI, restructuring)
+src/usage.rs          # usage parsing + cost/savings math
+src/store.rs          # rusqlite metrics store + broadcast channel for SSE
+src/dashboard.rs      # control plane: dashboard, JSON API, SSE, health probes
+src/logger.rs http_decode.rs identity.rs
+src/public/dashboard.html   # the live dashboard, embedded via include_str!
+src/bin/{backfill,cache_stats}.rs   # the two CLI tools
 ```
 
-- `src/server.js` — HTTP server on `127.0.0.1:$PORT`. Buffers request bodies, parses JSON on matching paths, runs transform → inject → rewrite → beta-header pipeline, streams responses through.
-- `src/transforms/default.js` — Default body mutator. Handles tool drops, ANSI stripping, and context-restructuring.
+- `src/server.rs` — async server on `$BIND_HOST:$PORT`. Buffers request bodies, parses JSON on matching paths, runs model-override → transform → cache-inject/rewrite → beta-header, then streams the upstream response straight back while tee-ing a bounded copy to the metering worker.
+- The metering worker (decode + parse + SQLite write) runs on a **dedicated OS thread**, never the reactor — so heavy concurrent traffic can't stall the proxy.
 - Logging: `LOG_BODIES=1` writes `<reqId>.req.json` (post-mutation, auth redacted) + `<reqId>.resp.log` (raw response) per request.
 
 See [CLAUDE.md](./CLAUDE.md) for full internals, order of operations, gotchas, and pointers for extending the transform pipeline.

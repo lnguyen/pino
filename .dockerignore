@@ -1,0 +1,13 @@
+target
+node_modules
+logs
+data
+test
+parity
+deploy
+.git
+.github
+.playwright-mcp
+*.png
+*.log
+*.md

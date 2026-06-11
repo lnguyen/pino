@@ -3,3 +3,17 @@ logs/
 .idea/
 .DS_Store
 *.log
+
+# Rust build artifacts
+/target/
+
+# Runtime metrics DB (contains your project paths + token counts)
+data/
+
+# Captured request/response fixtures — REAL prompt content (paths, CLAUDE.md).
+# Regenerate locally from logs/ with: node test/capture-fixtures.js
+test/fixtures/
+
+# Dev artifacts
+.playwright-mcp/
+/pino-*.png
