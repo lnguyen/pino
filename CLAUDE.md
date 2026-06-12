@@ -102,11 +102,33 @@ Headers are copied verbatim except `host`, `content-length`, and hop-by-hop head
 When `METRICS=1` (implied by `DASHBOARD=1`), the response stream is tee'd into a **bounded** buffer
 (`MAX_METER_BYTES`, 8 MB — beyond that, metering is skipped for that response and logged). On stream
 end the buffer is sent over an `mpsc` channel to a dedicated OS thread (`spawn_meter_worker`) that
-runs `decode_body → parse_usage → compute_cost → store.record_request`. This keeps decode + SQLite
-writes off the tokio reactor entirely — the fix for the Node "stopped responding" hang.
+runs `decode_body → parse_usage → compute_cost → compute_marginal → store.record_request`. This keeps
+decode + SQLite writes off the tokio reactor entirely — the fix for the Node "stopped responding" hang.
 `record_request` writes the row **and** publishes it on a `tokio::sync::broadcast` channel; the
 dashboard's `/api/stream` SSE endpoint forwards every row live. The **Cache write tier** panel
 surfaces `ephemeral_1h` vs `ephemeral_5m` write tokens.
+
+### Two savings baselines — vs-no-cache and vs-5m-default (src/usage.rs)
+
+`compute_cost.saved` prices each request against **zero caching** — useful as a gross number but the
+wrong baseline for judging the proxy, because Claude Code already does 5-minute caching for free. The
+proxy's only real lever is the 1h TTL bump, so `compute_marginal` prices it against **the default 5m
+cache**:
+- **write premium** — every `ephemeral_1h` token cost 2.0× vs the 1.25× a 5m write would have. Paid
+  unconditionally (`write_premium`, always ≥ 0).
+- **read benefit** — a `cache_read` only beats the 5m baseline when the gap since the session's
+  *previous request* exceeded 5 min: the default cache (TTL refreshed on every use) would have expired
+  and the tokens would have been re-written at 1.25× instead of read at 0.1×. Within 5 min the 1h bump
+  bought nothing.
+
+`saved_marginal = read_benefit − write_premium`. Per request the sign swings (write-only turns look
+like a loss; the later read shows the gain) but the halves telescope, so the **session/window SUM** is
+the honest net. The gap is `ts − last_ts_in_session(session, ts)`; unknown gap (first request in a
+session, or a backfill row with no predecessor) is treated conservatively as *not extended* (no read
+benefit claimed). The live worker reads the prev ts inline (rows arrive in time order); `backfill`
+sorts captures by `(session_id, ts)` before pricing. Columns `gap_ms`, `saved_marginal`,
+`write_premium` are added by an idempotent `ALTER TABLE` migration in `store.rs`. The dashboard headline
+is **Saved vs 5m**; `cache-stats` adds a `vs5m` column.
 
 ### Key invariant — the reference-free TTL skip set (src/cache.rs)
 

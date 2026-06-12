@@ -82,15 +82,16 @@ fn main() {
     };
     println!("\n  pino savings · by {group_by}{since_label}\n");
     println!(
-        "  {}{}{}{}{}{}",
+        "  {}{}{}{}{}{}{}",
         pad("name", 22),
         pad_l("reqs", 6),
         pad_l("cache rd", 11),
         pad_l("billed", 10),
         pad_l("saved", 10),
+        pad_l("vs5m", 10),
         pad_l("%", 7),
     );
-    println!("  {}", "─".repeat(64));
+    println!("  {}", "─".repeat(74));
 
     let getf = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
     let geti = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_i64()).unwrap_or(0);
@@ -98,28 +99,34 @@ fn main() {
     for r in &rows {
         let key = r.get("key").and_then(|k| k.as_str()).unwrap_or("");
         println!(
-            "  {}{}{}{}{}{}",
+            "  {}{}{}{}{}{}{}",
             pad(&short(key, &group_by), 22),
             pad_l(&geti(r, "requests").to_string(), 6),
             pad_l(&tok(geti(r, "cache_read")), 11),
             pad_l(&usd(getf(r, "cost_actual")), 10),
             pad_l(&usd(getf(r, "saved")), 10),
+            pad_l(&usd(getf(r, "saved_marginal")), 10),
             pad_l(&format!("{:.0}%", getf(r, "pct")), 7),
         );
     }
-    println!("  {}", "─".repeat(64));
+    println!("  {}", "─".repeat(74));
     println!(
-        "  {}{}{}{}{}{}",
+        "  {}{}{}{}{}{}{}",
         pad("TOTAL", 22),
         pad_l(&geti(&t, "requests").to_string(), 6),
         pad_l(&tok(geti(&t, "cache_read")), 11),
         pad_l(&usd(getf(&t, "cost_actual")), 10),
         pad_l(&usd(getf(&t, "saved")), 10),
+        pad_l(&usd(getf(&t, "saved_marginal")), 10),
         pad_l(&format!("{:.0}%", getf(&t, "pct")), 7),
     );
     println!(
-        "\n  saved {} of {} list-price input cost\n",
+        "\n  saved {} vs no cache · {} vs default 5m cache (the proxy's real win)",
         usd(getf(&t, "saved")),
-        usd(getf(&t, "cost_uncached"))
+        usd(getf(&t, "saved_marginal")),
+    );
+    println!(
+        "  paid {} in 1h write premium to get there\n",
+        usd(getf(&t, "write_premium")),
     );
 }

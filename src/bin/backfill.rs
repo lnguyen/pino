@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use pino::http_decode::{decode_body, model_from_response};
 use pino::identity::identify;
 use pino::store::{create_store, RowInput};
-use pino::usage::{compute_cost, model_family, parse_usage};
+use pino::usage::{compute_cost, compute_marginal, model_family, parse_usage, Usage};
 
 fn arg_or_env(idx: usize, env_key: &str, default: &str) -> String {
     std::env::args()
@@ -52,9 +52,11 @@ fn main() {
 
     let store = create_store(&db_path);
 
-    let mut inserted = 0u64;
     let mut skipped = 0u64;
 
+    // Parse every capture first; gap-since-previous needs session-ordered rows,
+    // and the log dir yields entries in arbitrary order.
+    let mut parsed: Vec<Parsed> = Vec::new();
     let entries = fs::read_dir(&log_dir).expect("read log dir");
     for entry in entries.filter_map(|e| e.ok()) {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -62,14 +64,40 @@ fn main() {
             continue;
         }
         let req_id = name.trim_end_matches(".resp.log").to_string();
-        match backfill_one(&log_dir, &req_id, &store) {
-            Ok(true) => inserted += 1,
-            Ok(false) => skipped += 1,
+        match backfill_one(&log_dir, &req_id) {
+            Ok(Some(p)) => parsed.push(p),
+            Ok(None) => skipped += 1,
             Err(e) => {
                 skipped += 1;
                 eprintln!("skip {req_id}: {e}");
             }
         }
+    }
+
+    // Order by (session, ts) so each row's gap is the time since its session's
+    // previous request, then price the 1h bump against the 5m baseline.
+    parsed.sort_by(|a, b| {
+        a.row
+            .session_id
+            .cmp(&b.row.session_id)
+            .then(a.row.ts.cmp(&b.row.ts))
+    });
+    let inserted = parsed.len() as u64;
+    let mut prev_session = String::new();
+    let mut prev_ts = 0i64;
+    for mut p in parsed {
+        let gap_ms = if p.row.session_id == prev_session && !p.row.session_id.is_empty() {
+            Some(p.row.ts - prev_ts)
+        } else {
+            None
+        };
+        let marginal = compute_marginal(&p.usage, &p.model, gap_ms);
+        p.row.gap_ms = gap_ms;
+        p.row.saved_marginal = marginal.saved;
+        p.row.write_premium = marginal.write_premium;
+        prev_session = p.row.session_id.clone();
+        prev_ts = p.row.ts;
+        store.record_request(&p.row);
     }
 
     let t = store.totals(0);
@@ -82,7 +110,15 @@ fn main() {
     );
 }
 
-fn backfill_one(log_dir: &Path, req_id: &str, store: &pino::store::SharedStore) -> Result<bool, String> {
+/// A parsed capture awaiting its session-relative gap before it can be priced
+/// against the 5m baseline and recorded.
+struct Parsed {
+    row: RowInput,
+    usage: Usage,
+    model: String,
+}
+
+fn backfill_one(log_dir: &Path, req_id: &str) -> Result<Option<Parsed>, String> {
     let resp_path = log_dir.join(format!("{req_id}.resp.log"));
     let raw = fs::read(&resp_path).map_err(|e| e.to_string())?;
     let (headers, body) = split_resp_log(&raw);
@@ -92,7 +128,7 @@ fn backfill_one(log_dir: &Path, req_id: &str, store: &pino::store::SharedStore) 
         .unwrap_or("");
     let text = decode_body(&body, enc);
     let Some(usage) = parse_usage(&text) else {
-        return Ok(false);
+        return Ok(None);
     };
 
     // Pair with the request log for identity + model fallback.
@@ -127,14 +163,14 @@ fn backfill_one(log_dir: &Path, req_id: &str, store: &pino::store::SharedStore) 
         cost.family.to_string()
     };
 
-    store.record_request(&RowInput {
+    let row = RowInput {
         req_id: req_id.to_string(),
         ts,
         session_id: identity.session_id,
         agent_id: identity.agent_id,
         parent_agent: identity.parent_agent_id,
         project: identity.project,
-        model,
+        model: model.clone(),
         family,
         input_tokens: usage.input_tokens,
         cache_read: usage.cache_read,
@@ -146,6 +182,8 @@ fn backfill_one(log_dir: &Path, req_id: &str, store: &pino::store::SharedStore) 
         cost_uncached: cost.cost_uncached,
         saved: cost.saved,
         estimate: cost.estimate,
-    });
-    Ok(true)
+        // gap_ms / saved_marginal / write_premium filled in once rows are sorted.
+        ..Default::default()
+    };
+    Ok(Some(Parsed { row, usage, model }))
 }

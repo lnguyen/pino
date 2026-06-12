@@ -215,7 +215,7 @@
       </table></div>
     </div>
 
-    <div class="note" id="note">Estimates use public list rates with cache multipliers (read 0.1× · 5m-write 1.25× · 1h-write 2×). Percentage saved is plan-independent.</div>
+    <div class="note" id="note">Estimates use public list rates with cache multipliers (read 0.1× · 5m-write 1.25× · 1h-write 2×). <b>Saved vs 5m</b> is the proxy's real contribution: 1h caching vs the 5m caching Claude Code already does for free. A cache read only beats the 5m baseline when &gt;5min passed since the session's previous request (the default cache would have expired); within 5min the 1h write premium bought nothing. <b>Saved vs uncached</b> is the gross figure vs no caching at all. Percentages are plan-independent.</div>
   </main>
 </div>
 
@@ -284,12 +284,13 @@ function setRing(t){ if(!ring)return; ring.data.datasets[0].data=[Math.max(0,t.c
 
 // ---------- KPIs ----------
 function renderKpis(t){
+  const marginal=t.saved_marginal||0;
   const cards=[
-    {c:'var(--sage)',name:'Saved',val:fmtUSD0(t.saved),sub:'vs '+fmtUSD0(t.cost_uncached)+' uncached'},
-    {c:'var(--gold)',name:'Reduction',val:(t.pct||0).toFixed(1)+'%',sub:'blended'},
+    {c:marginal>=0?'var(--sage)':'var(--gold)',name:'Saved vs 5m',val:fmtUSD0(marginal),sub:'1h bump vs default 5m'},
+    {c:'var(--gold)',name:'1h write premium',val:fmtUSD0(t.write_premium||0),sub:'paid to extend TTL'},
+    {c:'var(--navy)',name:'Saved vs uncached',val:fmtUSD0(t.saved),sub:'gross, vs no cache'},
     {c:'var(--navy)',name:'Cache reads',val:fmtTok(t.cache_read),sub:'@ 0.1× price'},
     {c:'var(--gold)',name:'Billed',val:fmtUSD0(t.cost_actual),sub:'after caching'},
-    {c:'var(--navy)',name:'Requests',val:''+(t.requests||0),sub:'metered'},
   ];
   document.getElementById('kpis').innerHTML=cards.map(c=>`<div class="kpi" style="--c:${c.c}">
     <div class="kpi__name">${c.name}</div><div class="kpi__val" id="kpi_${c.name}">${c.val}</div>
@@ -431,6 +432,8 @@ function connectSSE(){
     if(!liveTotals)liveTotals={...state.totals};
     liveTotals.requests=(liveTotals.requests||0)+1;
     liveTotals.saved=(liveTotals.saved||0)+row.saved;
+    liveTotals.saved_marginal=(liveTotals.saved_marginal||0)+(row.saved_marginal||0);
+    liveTotals.write_premium=(liveTotals.write_premium||0)+(row.write_premium||0);
     liveTotals.cost_actual=(liveTotals.cost_actual||0)+row.cost_actual;
     liveTotals.cost_uncached=(liveTotals.cost_uncached||0)+row.cost_uncached;
     liveTotals.cache_read=(liveTotals.cache_read||0)+row.cache_read;

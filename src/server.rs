@@ -26,7 +26,7 @@ use crate::logger::{file_ts, log, now_ms, rand_suffix, response_log_preamble, sa
 use crate::model::rewrite_system_model_refs;
 use crate::store::{create_store, RowInput, SharedStore};
 use crate::transform::Transform;
-use crate::usage::{compute_cost, model_family, parse_usage};
+use crate::usage::{compute_cost, compute_marginal, model_family, parse_usage};
 
 const MAX_BODY: usize = 256 * 1024 * 1024;
 
@@ -128,6 +128,10 @@ pub fn spawn_meter_worker(store: SharedStore) -> tokio::sync::mpsc::UnboundedSen
             } else {
                 cost.family.to_string()
             };
+            // Gap since this session's previous request decides whether the 1h
+            // bump beat the default 5m cache. Cheap indexed lookup, off-reactor.
+            let gap_ms = store.last_ts_in_session(&job.identity.session_id, job.ts).map(|prev| job.ts - prev);
+            let marginal = compute_marginal(&usage, &model, gap_ms);
             let row = RowInput {
                 req_id: job.req_id,
                 ts: job.ts,
@@ -147,6 +151,9 @@ pub fn spawn_meter_worker(store: SharedStore) -> tokio::sync::mpsc::UnboundedSen
                 cost_uncached: cost.cost_uncached,
                 saved: cost.saved,
                 estimate: cost.estimate,
+                gap_ms,
+                saved_marginal: marginal.saved,
+                write_premium: marginal.write_premium,
             };
             store.record_request(&row);
         }
