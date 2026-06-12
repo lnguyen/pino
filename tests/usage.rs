@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use pino::usage::{compute_cost, model_family, parse_usage};
+use pino::usage::{compute_cost, compute_marginal, model_family, parse_usage, Usage, FIVE_MIN_MS};
 
 fn fixture() -> Option<String> {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test/fixtures/stream.sse.txt");
@@ -73,4 +73,52 @@ fn unknown_model_flagged_as_estimate() {
     let Some(sse) = fixture() else { return };
     let c = compute_cost(&parse_usage(&sse).unwrap(), "some-future-model");
     assert!(c.estimate);
+}
+
+// ---- marginal: 1h cache vs Claude Code's free 5m default ----
+
+fn usage_rw(cache_read: i64, ephem_1h: i64) -> Usage {
+    Usage { cache_read, ephem_1h, ..Default::default() }
+}
+
+#[test]
+fn marginal_within_5min_is_pure_write_premium_loss() {
+    // Gap under 5min: the default 5m cache would have hit too, so the 1h write
+    // premium bought nothing — net is the premium, paid for nothing.
+    let u = usage_rw(10_000, 2_000);
+    let m = compute_marginal(&u, "claude-opus-4-8", Some(FIVE_MIN_MS - 1));
+    assert!(!m.extended_window);
+    // opus in-price 5/M; premium = 2000 * (2.0-1.25) * 5e-6
+    let premium = 2_000.0 * 0.75 * (5.0 / 1e6);
+    assert!((m.write_premium - premium).abs() < 1e-12);
+    assert!((m.saved - (-premium)).abs() < 1e-12, "should be a net loss");
+}
+
+#[test]
+fn marginal_past_5min_credits_the_read() {
+    // Gap >= 5min: the default 5m cache would have expired and missed, so the
+    // read at 0.1x replaced a 1.25x re-write — that delta is the real saving.
+    let u = usage_rw(10_000, 2_000);
+    let m = compute_marginal(&u, "claude-opus-4-8", Some(FIVE_MIN_MS));
+    assert!(m.extended_window);
+    let read_benefit = 10_000.0 * (1.25 - 0.1) * (5.0 / 1e6);
+    let premium = 2_000.0 * 0.75 * (5.0 / 1e6);
+    assert!((m.saved - (read_benefit - premium)).abs() < 1e-12);
+    assert!(m.saved > 0.0);
+}
+
+#[test]
+fn marginal_unknown_gap_is_conservative() {
+    // First request in a session / backfill with no predecessor: don't claim a
+    // read benefit we can't justify.
+    let m = compute_marginal(&usage_rw(10_000, 2_000), "claude-opus-4-8", None);
+    assert!(!m.extended_window);
+    assert!(m.saved <= 0.0);
+}
+
+#[test]
+fn marginal_zero_when_nothing_cached() {
+    let m = compute_marginal(&Usage::default(), "claude-opus-4-8", Some(FIVE_MIN_MS * 10));
+    assert_eq!(m.saved, 0.0);
+    assert_eq!(m.write_premium, 0.0);
 }

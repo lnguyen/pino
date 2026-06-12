@@ -30,12 +30,41 @@ CREATE TABLE IF NOT EXISTS requests (
   cost_actual   REAL,
   cost_uncached REAL,
   saved         REAL,
-  estimate      INTEGER DEFAULT 0
+  estimate      INTEGER DEFAULT 0,
+  gap_ms        INTEGER,
+  saved_marginal REAL DEFAULT 0,
+  write_premium  REAL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_req_ts       ON requests(ts);
 CREATE INDEX IF NOT EXISTS idx_req_project  ON requests(project, ts);
-CREATE INDEX IF NOT EXISTS idx_req_session  ON requests(session_id);
+CREATE INDEX IF NOT EXISTS idx_req_session  ON requests(session_id, ts);
 ";
+
+/// Columns added after the original schema shipped. Applied as idempotent
+/// ALTER TABLE ADD COLUMN so DBs created by an older build pick them up.
+const MIGRATIONS: &[(&str, &str)] = &[
+    ("gap_ms", "ALTER TABLE requests ADD COLUMN gap_ms INTEGER"),
+    ("saved_marginal", "ALTER TABLE requests ADD COLUMN saved_marginal REAL DEFAULT 0"),
+    ("write_premium", "ALTER TABLE requests ADD COLUMN write_premium REAL DEFAULT 0"),
+];
+
+/// Add any columns missing from a pre-existing `requests` table.
+fn migrate(conn: &Connection) {
+    let existing: std::collections::HashSet<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(requests)").unwrap();
+        let cols = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        cols
+    };
+    for (col, ddl) in MIGRATIONS {
+        if !existing.contains(*col) {
+            conn.execute_batch(ddl).expect("apply migration");
+        }
+    }
+}
 
 /// One metered request, as handed to the store. All fields canonical snake_case.
 #[derive(Clone, Debug, Default)]
@@ -58,6 +87,13 @@ pub struct RowInput {
     pub cost_uncached: f64,
     pub saved: f64,
     pub estimate: bool,
+    /// Time since the previous request in this session (ms). None for the first
+    /// request in a session or a backfill row with no known predecessor.
+    pub gap_ms: Option<i64>,
+    /// Net dollars the 1h cache bump saved over Claude Code's default 5m cache.
+    pub saved_marginal: f64,
+    /// Extra dollars paid this request to write at 1h instead of 5m.
+    pub write_premium: f64,
 }
 
 pub struct Store {
@@ -89,6 +125,7 @@ pub fn create_store(db_path: &str) -> SharedStore {
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
         .expect("set pragmas");
     conn.execute_batch(SCHEMA).expect("init schema");
+    migrate(&conn);
 
     let (tx, _rx) = broadcast::channel(1024);
     Arc::new(Store {
@@ -120,6 +157,23 @@ impl Store {
         self.tx.subscribe()
     }
 
+    /// The most recent request timestamp for `session_id` strictly before `ts`,
+    /// if any. Used to derive the inter-request gap that decides whether the 1h
+    /// cache bump actually beat the default 5m cache.
+    pub fn last_ts_in_session(&self, session_id: &str, ts: i64) -> Option<i64> {
+        if session_id.is_empty() {
+            return None;
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT MAX(ts) FROM requests WHERE session_id = ? AND ts < ?",
+            rusqlite::params![session_id, ts],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .ok()
+        .flatten()
+    }
+
     /// Insert one request row, publish it for SSE, and return the clean row.
     pub fn record_request(&self, r: &RowInput) -> Value {
         let clean = json!({
@@ -141,6 +195,9 @@ impl Store {
             "cost_uncached": r.cost_uncached,
             "saved": r.saved,
             "estimate": if r.estimate { 1 } else { 0 },
+            "gap_ms": r.gap_ms,
+            "saved_marginal": r.saved_marginal,
+            "write_premium": r.write_premium,
         });
 
         {
@@ -149,8 +206,8 @@ impl Store {
                 "INSERT OR REPLACE INTO requests (
                     req_id, ts, session_id, agent_id, parent_agent, project, model, family,
                     input_tokens, cache_read, cache_create, ephem_5m, ephem_1h, output_tokens,
-                    cost_actual, cost_uncached, saved, estimate
-                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    cost_actual, cost_uncached, saved, estimate, gap_ms, saved_marginal, write_premium
+                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 rusqlite::params![
                     clean["req_id"].as_str().unwrap_or(""),
                     r.ts,
@@ -170,6 +227,9 @@ impl Store {
                     r.cost_uncached,
                     r.saved,
                     if r.estimate { 1i64 } else { 0i64 },
+                    r.gap_ms,
+                    r.saved_marginal,
+                    r.write_premium,
                 ],
             )
             .expect("insert request row");
@@ -194,6 +254,8 @@ impl Store {
                     COALESCE(SUM(cost_actual),0)   AS cost_actual,
                     COALESCE(SUM(cost_uncached),0) AS cost_uncached,
                     COALESCE(SUM(saved),0)         AS saved,
+                    COALESCE(SUM(saved_marginal),0) AS saved_marginal,
+                    COALESCE(SUM(write_premium),0)  AS write_premium,
                     MAX(family)                    AS family,
                     MAX(ts)                        AS last_ts
              FROM requests
@@ -263,7 +325,9 @@ impl Store {
                         COALESCE(SUM(output_tokens),0) AS output_tokens,
                         COALESCE(SUM(cost_actual),0)   AS cost_actual,
                         COALESCE(SUM(cost_uncached),0) AS cost_uncached,
-                        COALESCE(SUM(saved),0)         AS saved
+                        COALESCE(SUM(saved),0)         AS saved,
+                        COALESCE(SUM(saved_marginal),0) AS saved_marginal,
+                        COALESCE(SUM(write_premium),0)  AS write_premium
                  FROM requests WHERE ts >= ?",
             )
             .unwrap();
@@ -304,6 +368,7 @@ impl Store {
                 "SELECT CAST(ts / CAST(? AS INTEGER) AS INTEGER) * CAST(? AS INTEGER) AS bucket,
                         COUNT(*)                       AS requests,
                         COALESCE(SUM(saved),0)         AS saved,
+                        COALESCE(SUM(saved_marginal),0) AS saved_marginal,
                         COALESCE(SUM(cost_actual),0)   AS cost_actual,
                         COALESCE(SUM(cache_read),0)    AS cache_read
                  FROM requests WHERE ts >= ?
@@ -316,8 +381,9 @@ impl Store {
                     "t": row.get::<_, i64>(0)?,
                     "requests": row.get::<_, i64>(1)?,
                     "saved": row.get::<_, f64>(2)?,
-                    "cost_actual": row.get::<_, f64>(3)?,
-                    "cache_read": row.get::<_, i64>(4)?,
+                    "saved_marginal": row.get::<_, f64>(3)?,
+                    "cost_actual": row.get::<_, f64>(4)?,
+                    "cache_read": row.get::<_, i64>(5)?,
                 }))
             })
             .unwrap()

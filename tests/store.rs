@@ -73,6 +73,35 @@ fn record_request_emits_live_event() {
 }
 
 #[test]
+fn last_ts_in_session_finds_prior_request() {
+    let store = create_store(":memory:");
+    seed(&store);
+    // s1 has r1@1000, r2@2000.
+    assert_eq!(store.last_ts_in_session("s1", 2000), Some(1000));
+    assert_eq!(store.last_ts_in_session("s1", 1000), None); // nothing before the first
+    assert_eq!(store.last_ts_in_session("s2", 3000), None); // s2's only row
+    assert_eq!(store.last_ts_in_session("", 9999), None); // empty session never matches
+}
+
+#[test]
+fn totals_aggregate_marginal_and_premium() {
+    let store = create_store(":memory:");
+    store.record_request(&RowInput {
+        req_id: "m1".into(), ts: 1000, session_id: "s1".into(),
+        model: "claude-opus-4-8".into(), family: "opus".into(),
+        saved_marginal: -0.01, write_premium: 0.01, ..Default::default()
+    });
+    store.record_request(&RowInput {
+        req_id: "m2".into(), ts: 600_000 + 1000, session_id: "s1".into(),
+        model: "claude-opus-4-8".into(), family: "opus".into(),
+        saved_marginal: 0.05, write_premium: 0.01, ..Default::default()
+    });
+    let t = store.totals(0);
+    assert!((t["saved_marginal"].as_f64().unwrap() - 0.04).abs() < 1e-9);
+    assert!((t["write_premium"].as_f64().unwrap() - 0.02).abs() < 1e-9);
+}
+
+#[test]
 fn session_meta_reports_project_and_model_mix() {
     let store = create_store(":memory:");
     seed(&store);

@@ -24,6 +24,12 @@ pub const CACHE_READ: f64 = 0.1; // cache hit
 pub const CACHE_WRITE_5M: f64 = 1.25; // ephemeral 5-minute write
 pub const CACHE_WRITE_1H: f64 = 2.0; // ephemeral 1-hour write
 
+/// The default ephemeral cache lifetime Claude Code already gets for free. A
+/// cache entry survives this long *and* its TTL is refreshed every time it's
+/// used — so the relevant question for "did the proxy's 1h bump help?" is
+/// whether the gap since the previous request in the session exceeded this.
+pub const FIVE_MIN_MS: i64 = 5 * 60 * 1000;
+
 /// Map a model id to a price family. Unknown ids fall back to opus.
 pub fn model_family(model: &str) -> &'static str {
     let m = model.to_lowercase();
@@ -162,5 +168,60 @@ pub fn compute_cost(usage: &Usage, model: &str) -> Cost {
         cost_uncached,
         saved,
         saved_pct,
+    }
+}
+
+/// The proxy's *marginal* contribution: 1h caching vs the 5-minute caching
+/// Claude Code already does for free.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Marginal {
+    /// Net dollars the 1h bump saved over the 5m default for this request.
+    /// Negative when the 1h write premium bought nothing (gap < 5min).
+    pub saved: f64,
+    /// Extra dollars paid to write at 1h instead of 5m on this request. Always
+    /// ≥ 0; only "worth it" if a later read lands in the 5m–1h window.
+    pub write_premium: f64,
+    /// Whether the gap since the previous request in this session exceeded the
+    /// 5m default lifetime — i.e. the default cache would have expired and the
+    /// 1h bump is what kept this request's `cache_read` alive.
+    pub extended_window: bool,
+}
+
+/// Reprice a request against the realistic baseline: Claude Code's default 5m
+/// caching, not "no cache at all" (which `compute_cost.saved` assumes).
+///
+/// `gap_ms` is the time since the previous request in the same session. `None`
+/// (first request in a session, or a backfill row with no predecessor) is
+/// treated conservatively as *not* extended — we don't claim a save we can't
+/// justify.
+///
+/// Two effects, both priced off the base input rate:
+///  * **write premium** — every `ephem_1h` token cost 2.0× instead of the 1.25×
+///    a default 5m write would have cost. Paid unconditionally on this request.
+///  * **read benefit** — a `cache_read` only beats the 5m baseline when the gap
+///    exceeded 5min: the default cache would have expired, so those tokens would
+///    have been re-written at 1.25× instead of read at 0.1×. Within 5min the
+///    default cache (TTL refreshed on use) would have hit too → zero benefit.
+///
+/// Per request the sign swings (a turn that only *writes* the prefix looks like
+/// a loss; the turn that later *reads* it shows the gain), but the two halves
+/// telescope: summed over a session, `saved` is the honest net of the 1h bump.
+pub fn compute_marginal(usage: &Usage, model: &str, gap_ms: Option<i64>) -> Marginal {
+    let (in_price, _) = prices(model_family(model));
+    let per_token = in_price / 1_000_000.0;
+
+    let extended = gap_ms.map(|g| g >= FIVE_MIN_MS).unwrap_or(false);
+
+    let write_premium = (usage.ephem_1h as f64) * (CACHE_WRITE_1H - CACHE_WRITE_5M) * per_token;
+    let read_benefit = if extended {
+        (usage.cache_read as f64) * (CACHE_WRITE_5M - CACHE_READ) * per_token
+    } else {
+        0.0
+    };
+
+    Marginal {
+        saved: read_benefit - write_premium,
+        write_premium,
+        extended_window: extended,
     }
 }
