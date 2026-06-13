@@ -280,21 +280,42 @@ function pushArea(saved){
   area.data.labels=areaPts.map(p=>fmtAxis(p.t));
   area.data.datasets[0].data=areaPts.map(p=>p.y);area.update('none');
 }
-function setRing(t){ if(!ring)return; ring.data.datasets[0].data=[Math.max(0,t.cost_actual),Math.max(0,t.saved)];ring.update();}
+function setRing(t,mode){ if(!ring)return; ring.data.datasets[0].data=[Math.max(0,t.cost_actual),Math.max(0,t.saved)];ring.update(mode);}
 
 // ---------- KPIs ----------
-function renderKpis(t){
+// Build the card skeleton once, then update values in place. Rebuilding the
+// whole innerHTML on every live SSE event is what made the header flash.
+const KPI_DEFS=[
+  {key:'m5',name:'Saved vs 5m'},
+  {key:'unc',name:'Saved vs uncached'},
+  {key:'rd',name:'Cache reads'},
+  {key:'billed',name:'Billed'},
+  {key:'reqs',name:'Requests'},
+];
+function kpiValues(t){
   const marginal=t.saved_marginal||0;
-  const cards=[
-    {c:marginal>=0?'var(--sage)':'var(--gold)',name:'Saved vs 5m',val:fmtUSD0(marginal),sub:fmtUSD0(t.write_premium||0)+' 1h write premium'},
-    {c:'var(--navy)',name:'Saved vs uncached',val:fmtUSD0(t.saved),sub:'gross, vs no cache'},
-    {c:'var(--navy)',name:'Cache reads',val:fmtTok(t.cache_read),sub:'@ 0.1× price'},
-    {c:'var(--gold)',name:'Billed',val:fmtUSD0(t.cost_actual),sub:'after caching'},
-    {c:'var(--navy)',name:'Requests',val:''+(t.requests||0),sub:'metered'},
-  ];
-  document.getElementById('kpis').innerHTML=cards.map(c=>`<div class="kpi" style="--c:${c.c}">
-    <div class="kpi__name">${c.name}</div><div class="kpi__val" id="kpi_${c.name}">${c.val}</div>
-    <div class="kpi__sub">${c.sub}</div></div>`).join('');
+  return {
+    m5:{c:marginal>=0?'var(--sage)':'var(--gold)',val:fmtUSD0(marginal),sub:fmtUSD0(t.write_premium||0)+' 1h write premium'},
+    unc:{c:'var(--navy)',val:fmtUSD0(t.saved),sub:'gross, vs no cache'},
+    rd:{c:'var(--navy)',val:fmtTok(t.cache_read),sub:'@ 0.1× price'},
+    billed:{c:'var(--gold)',val:fmtUSD0(t.cost_actual),sub:'after caching'},
+    reqs:{c:'var(--navy)',val:''+(t.requests||0),sub:'metered'},
+  };
+}
+function renderKpis(t){
+  const v=kpiValues(t),host=document.getElementById('kpis');
+  if(!host.firstChild){
+    host.innerHTML=KPI_DEFS.map(d=>`<div class="kpi" id="kpiCard_${d.key}" style="--c:${v[d.key].c}">
+      <div class="kpi__name">${d.name}</div><div class="kpi__val" id="kpiVal_${d.key}">${v[d.key].val}</div>
+      <div class="kpi__sub" id="kpiSub_${d.key}">${v[d.key].sub}</div></div>`).join('');
+    return;
+  }
+  for(const d of KPI_DEFS){
+    const card=document.getElementById('kpiCard_'+d.key),val=document.getElementById('kpiVal_'+d.key),sub=document.getElementById('kpiSub_'+d.key);
+    if(card)card.style.setProperty('--c',v[d.key].c);
+    if(val&&val.textContent!==v[d.key].val)val.textContent=v[d.key].val;
+    if(sub&&sub.textContent!==v[d.key].sub)sub.textContent=v[d.key].sub;
+  }
 }
 
 // ---------- TTL tier, broken down per model (the honest representation) ----------
@@ -374,6 +395,10 @@ const qs=()=>`since=${encodeURIComponent(state.since)}`;
 async function loadStats(){
   const r=await fetch(`/__pino/api/stats?groupBy=${state.group}&${qs()}`);const d=await r.json();
   state.rows=d.rows||[];state.totals=d.totals||{};
+  // Re-base the live counters on the windowed totals so SSE increments stay inside
+  // the selected window. The SSE 'hello' is all-time and must not become the base,
+  // or the KPIs flip-flop between windowed and all-time (the "flashing"/not-24h bug).
+  liveTotals={...state.totals};
   renderKpis(state.totals);setRing(state.totals);renderBars();renderTable();
 }
 async function loadTtl(){
@@ -405,11 +430,11 @@ async function loadCounts(){
 function reloadAll(){loadStats();loadSeries();loadCounts();loadTtl();}
 
 // ---------- live SSE ----------
-let liveTotals=null,feedCount=0,refreshTimer=null;
+let liveTotals=null,feedCount=0;
 function bumpKpi(){
   if(!liveTotals)return;
-  renderKpis(liveTotals);setRing(liveTotals);
-  const el=document.getElementById('kpi_Saved vs 5m');if(el){el.classList.remove('flash');void el.offsetWidth;el.classList.add('flash');}
+  renderKpis(liveTotals);setRing(liveTotals,'none');
+  const el=document.getElementById('kpiVal_m5');if(el){el.classList.remove('flash');void el.offsetWidth;el.classList.add('flash');}
 }
 function addFeed(row){
   const feed=document.getElementById('feed');
@@ -423,10 +448,24 @@ function addFeed(row){
   feed.prepend(div);while(feed.children.length>14)feed.removeChild(feed.lastChild);
   document.getElementById('feedSub').textContent=` · ${++feedCount} live`;
 }
+// The bars/table/TTL/counts can't update incrementally, so a live event has to
+// trigger a full reload of them. Doing that after every turn rebuilds large
+// tables constantly (the "flashing all the data"). Coalesce to a leading+trailing
+// throttle so they refresh at most once per HEAVY_GAP_MS while traffic flows.
+const HEAVY_GAP_MS=8000;
+let lastHeavy=0,heavyTimer=null;
+function runHeavyReload(){lastHeavy=Date.now();loadStats();loadCounts();loadTtl();}
+function scheduleHeavyReload(){
+  const since=Date.now()-lastHeavy;
+  if(since>=HEAVY_GAP_MS){runHeavyReload();}
+  else if(!heavyTimer){heavyTimer=setTimeout(()=>{heavyTimer=null;runHeavyReload();},HEAVY_GAP_MS-since);}
+}
 function connectSSE(){
   const conn=document.getElementById('conn'),txt=document.getElementById('connText');
   const es=new EventSource('/__pino/api/stream');
-  es.addEventListener('hello',e=>{liveTotals={...JSON.parse(e.data)};});
+  // 'hello' carries all-time totals — ignore it for the windowed view. loadStats()
+  // owns liveTotals' base; live 'request' events only increment from there.
+  es.addEventListener('hello',()=>{});
   es.addEventListener('request',e=>{
     const row=JSON.parse(e.data);
     if(!liveTotals)liveTotals={...state.totals};
@@ -441,7 +480,7 @@ function connectSSE(){
     liveTotals.ephem_1h=(liveTotals.ephem_1h||0)+(row.ephem_1h||0);
     liveTotals.pct=liveTotals.cost_uncached>0?liveTotals.saved/liveTotals.cost_uncached*100:0;
     bumpKpi();pushArea(row.saved);addFeed(row);
-    clearTimeout(refreshTimer);refreshTimer=setTimeout(()=>{loadStats();loadCounts();loadTtl();},1200);
+    scheduleHeavyReload();
   });
   es.onopen=()=>{conn.className='conn on';txt.textContent='live';};
   es.onerror=()=>{conn.className='conn off';txt.textContent='reconnecting…';};
