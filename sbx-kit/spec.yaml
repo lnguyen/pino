@@ -1,0 +1,103 @@
+schemaVersion: "1"
+kind: mixin
+name: pino-cache
+displayName: Pino prompt-cache proxy
+description: >-
+  Runs pino-proxy as an in-container sidecar in front of Claude Code. It
+  auto-places prompt-cache breakpoints and forces a 1h cache TTL to cut
+  Anthropic API spend (~90% on a typical Claude Code session). Transparent to
+  auth: Claude talks to pino on loopback, and pino forwards to api.anthropic.com
+  THROUGH the sandbox proxy, which still injects the real credential.
+
+environment:
+  variables:
+    # ONLY ANTHROPIC_BASE_URL is container-wide: the claude agent process must
+    # inherit it so its API calls hit the local pino sidecar. 127.0.0.1 is in the
+    # container NO_PROXY, so this leg bypasses the sandbox proxy and pino sees the
+    # plaintext body. All pino-runtime config (AUTO_CACHE, DASHBOARD, DB_PATH, …)
+    # is NOT set here — it would needlessly pollute claude + every shell. Those
+    # are scoped to the pino process via `env ...` in the startup command below.
+    ANTHROPIC_BASE_URL: "http://127.0.0.1:8898"
+
+commands:
+  install:
+    - user: "0"
+      description: "Install pino-proxy from its OCI image via crane"
+      command: |
+        set -eu
+        # Skip only if a pino-proxy that actually executes on THIS arch is present.
+        # A wrong-arch binary (rc 126 "Exec format error") must be re-extracted.
+        if command -v pino-proxy >/dev/null 2>&1; then
+          pino-proxy --healthcheck >/dev/null 2>&1 || rc=$?; rc=${rc:-0}
+          if [ "$rc" != "126" ] && [ "$rc" != "127" ]; then
+            echo "pino-cache: working pino-proxy already present"; exit 0
+          fi
+          echo "pino-cache: existing pino-proxy not executable here (rc=$rc), reinstalling"
+        fi
+        # The image built+pushed by `make push` (see sbx-kit/README.md).
+        # Keep in sync with IMAGE/TAG in the repo Makefile.
+        PINO_IMAGE="${PINO_IMAGE:-docker.io/longnguyen58445/pino:sbx}"
+        ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+        case "$ARCH" in
+          amd64) CRANE_ARCH=x86_64 ;;
+          arm64) CRANE_ARCH=arm64 ;;
+          *) echo "pino-cache: unsupported arch $ARCH" >&2; exit 1 ;;
+        esac
+        CRANE_VERSION=v0.20.2
+        echo "pino-cache: fetching crane ${CRANE_VERSION} (${CRANE_ARCH})"
+        curl -fsSL "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_${CRANE_ARCH}.tar.gz" \
+          | tar -C /usr/local/bin -xzf - crane
+        echo "pino-cache: extracting /usr/local/bin/pino-proxy (linux/${ARCH}) from ${PINO_IMAGE}"
+        # --platform is REQUIRED: PINO_IMAGE is a multi-arch index and crane
+        # export otherwise defaults to linux/amd64 → "Exec format error" on arm64.
+        crane export --platform "linux/${ARCH}" "$PINO_IMAGE" - | tar -C / -xf - usr/local/bin/pino-proxy
+        chmod 0755 /usr/local/bin/pino-proxy
+        echo "pino-cache: installed $(command -v pino-proxy)"
+  startup:
+    # 1) Prepare pino's writable dir and wait for the sandbox proxy CA to land,
+    #    so pino's TLS client (which reads SSL_CERT_FILE at startup) trusts the
+    #    MITM cert on its hop to api.anthropic.com. Times out after 30s; never fails.
+    - user: "1000"
+      description: "Prepare pino data dir and wait for the sandbox proxy CA"
+      command: ["sh", "-c", "mkdir -p /home/agent/.pino/logs; for i in $(seq 1 30); do [ -s /usr/local/share/ca-certificates/proxy-ca.crt ] && break; sleep 1; done; exit 0"]
+    # 2) Launch the sidecar (detached). pino's config is set INLINE via `env` so
+    #    it lives only in the pino process, not the container-wide env. BIND_HOST
+    #    0.0.0.0 also serves loopback (Claude) + the published port (host dashboard).
+    - user: "1000"
+      background: true
+      description: "Launch pino-proxy sidecar (config scoped to this process)"
+      command:
+        - env
+        - BIND_HOST=0.0.0.0
+        - AUTO_CACHE=1
+        - TAIL_TTL=1h
+        - METRICS=1
+        - DASHBOARD=1
+        - DB_PATH=/home/agent/.pino/metrics.db
+        - LOG_DIR=/home/agent/.pino/logs
+        - pino-proxy
+
+network:
+  # Egress needed at install time to fetch crane + pull the pino image.
+  # (api.anthropic.com is already allowed by the claude agent itself.)
+  allowedDomains:
+    # crane release download
+    - "github.com:443"
+    - "objects.githubusercontent.com:443"
+    - "release-assets.githubusercontent.com:443"
+    # Docker Hub (if PINO_IMAGE is on docker.io)
+    - "registry-1.docker.io:443"
+    - "auth.docker.io:443"
+    - "production.cloudflare.docker.com:443"
+    # GHCR (if PINO_IMAGE is on ghcr.io)
+    - "ghcr.io:443"
+    - "pkg-containers.githubusercontent.com:443"
+
+memory: |
+  Anthropic API traffic from Claude Code is routed through a local pino-proxy
+  sidecar at http://127.0.0.1:8898. It injects prompt-cache breakpoints and
+  forces a 1h cache TTL to cut API cost; it is transparent to auth (the real
+  credential is still injected by the sandbox proxy on the hop to
+  api.anthropic.com). Live savings dashboard: http://127.0.0.1:8898/__pino/
+  (view from inside the sandbox: `curl http://127.0.0.1:8898/__pino/`).
+  Startup logs: `cat /var/log/sbx-kit-startup.log`.

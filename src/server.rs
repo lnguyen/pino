@@ -474,7 +474,28 @@ pub fn build_app(config: Config) -> (Router, String) {
         None
     };
 
-    let client = reqwest::Client::builder()
+    // Outbound HTTPS client. Honor SSL_CERT_FILE for extra trust roots so a
+    // MITM proxy that re-signs upstream TLS (Docker Sandboxes, corporate egress
+    // proxies) validates: its CA lives in the bundle SSL_CERT_FILE points at.
+    // Added on top of the built-in roots, and a no-op when SSL_CERT_FILE is
+    // unset, so normal direct use is unchanged.
+    let mut client_builder = reqwest::Client::builder();
+    if let Ok(ca_path) = std::env::var("SSL_CERT_FILE") {
+        match std::fs::read(&ca_path) {
+            Ok(pem) => match reqwest::tls::Certificate::from_pem_bundle(&pem) {
+                Ok(certs) => {
+                    let n = certs.len();
+                    for cert in certs {
+                        client_builder = client_builder.add_root_certificate(cert);
+                    }
+                    eprintln!("[pino] trusting {n} extra CA cert(s) from SSL_CERT_FILE={ca_path}");
+                }
+                Err(e) => eprintln!("[pino] WARN: could not parse SSL_CERT_FILE={ca_path}: {e}"),
+            },
+            Err(e) => eprintln!("[pino] WARN: could not read SSL_CERT_FILE={ca_path}: {e}"),
+        }
+    }
+    let client = client_builder
         .build()
         .expect("build reqwest client");
 
